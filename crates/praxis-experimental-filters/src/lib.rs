@@ -7,9 +7,11 @@
 //! [`praxis_filter::export_filters!`] macro invoked below.
 
 mod placeholder;
+mod switchyard_failure_target;
 mod switchyard_route;
 
 praxis_filter::export_filters! {
     http "experimental_placeholder" => placeholder::PlaceholderFilter::from_config,
+    http "switchyard_failure_target" => switchyard_failure_target::SwitchyardFailureTargetFilter::from_config,
     http "switchyard_route" => switchyard_route::SwitchyardRouteFilter::from_config,
 }

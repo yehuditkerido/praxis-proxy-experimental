@@ -32,7 +32,7 @@ use praxis_filter::{BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter,
 use switchyard_libsy::Algorithm;
 use tracing::{debug, warn};
 
-use self::config::{RouteConfig, SessionFloor, Tier};
+use self::config::{FailureMode, RouteConfig, SessionFloor, Tier};
 
 /// Metadata key for the chosen cluster (body phase → `on_request`).
 const METADATA_CLUSTER: &str = "switchyard_route.cluster";
@@ -85,8 +85,16 @@ impl SwitchyardRouteFilter {
     ///
     /// When `session_floor` is enabled and the session is already at Strong,
     /// the judge is skipped entirely (the outcome would be Strong regardless).
-    async fn route(&self, ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) -> Result<Tier, RouteError> {
+    async fn route(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<Option<Tier>, RouteError> {
         let value = parse_body(body.as_ref())?;
+
+        if !self.config.request_scope.includes(&value) {
+            return Ok(None);
+        }
 
         // Upstream translators normalize Responses and Anthropic bodies to Chat
         // before this phase. Keep their public path visible so downstream
@@ -109,7 +117,7 @@ impl SwitchyardRouteFilter {
                 ctx.set_metadata(METADATA_CLUSTER, cluster);
                 ctx.set_metadata(METADATA_DECISION, failure::DECISION_FLOOR_SKIP);
                 debug!(tier = %floor.tag(), "switchyard_route: floor_skip");
-                return Ok(floor);
+                return Ok(Some(floor));
             }
         }
 
@@ -127,7 +135,7 @@ impl SwitchyardRouteFilter {
             self.lock_sessions()
                 .remember(&key, tier, Instant::now(), self.config.session_floor);
         }
-        Ok(tier)
+        Ok(Some(tier))
     }
 
     /// Recovers from a poisoned mutex so one panicked request cannot stick the filter.
@@ -135,7 +143,7 @@ impl SwitchyardRouteFilter {
         self.sessions.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records the error and applies `on_failure` (reuse / default Strong / 503 / unrouted).
+    /// Records the error and applies scope-aware failure policy.
     fn on_route_error(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -150,7 +158,12 @@ impl SwitchyardRouteFilter {
             let key = session::session_key_from_request(&ctx.request.headers, value)?;
             self.lock_sessions().last_success(&key, Instant::now())
         });
-        match failure::failure_action(self.config.on_failure, may_apply, remembered) {
+        let mode = if self.config.failure_scope.handles_judge() && err.is_judge_failure() {
+            FailureMode::Closed
+        } else {
+            self.config.on_failure
+        };
+        match failure::failure_action(mode, may_apply, remembered) {
             failure::FailureAction::Reject => reject_closed(ctx),
             failure::FailureAction::Unrouted => fail_open_unrouted(ctx),
             failure::FailureAction::Apply(apply) => match parsed {
@@ -382,10 +395,13 @@ impl HttpFilter for SwitchyardRouteFilter {
     }
 
     fn selects_cluster(&self) -> bool {
-        true
+        self.config.request_scope == config::RequestScope::All
     }
 
     fn selected_clusters(&self) -> Vec<String> {
+        if self.config.request_scope != config::RequestScope::All {
+            return Vec::new();
+        }
         vec![self.config.weak.cluster.clone(), self.config.strong.cluster.clone()]
     }
 
@@ -409,6 +425,10 @@ impl HttpFilter for SwitchyardRouteFilter {
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if let Some(cluster) = ctx.get_metadata(METADATA_CLUSTER) {
             ctx.cluster = Some(cluster.into());
+            ctx.filter_results
+                .entry("switchyard_route")
+                .or_default()
+                .set("status", "selected")?;
         }
         Ok(FilterAction::Continue)
     }
@@ -700,6 +720,14 @@ enum RouteError {
 }
 
 impl RouteError {
+    /// Whether this error came from executing or interpreting the judge.
+    fn is_judge_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::MissingSubrequestClient | Self::Judge(_) | Self::Run(_) | Self::NoDecision | Self::UnknownTier(_)
+        )
+    }
+
     /// Whether this failure is a chat request we may rewrite to a fallback tier.
     fn may_apply_failure_tier(&self) -> bool {
         match self {
@@ -875,9 +903,29 @@ mod tests {
         serde_yaml::from_str(&yaml).expect("test config YAML parses")
     }
 
+    /// Builds filter YAML with an explicit failure scope.
+    fn config_yaml_with_scope(endpoint: &str, on_failure: &str, scope: &str) -> serde_yaml::Value {
+        let mut yaml = config_yaml(endpoint, on_failure);
+        yaml["failure_scope"] = serde_yaml::Value::String(scope.to_owned());
+        yaml
+    }
+
     /// Builds a filter whose judge lives at `endpoint`.
     fn make_filter(endpoint: &str, on_failure: &str) -> Box<dyn HttpFilter> {
         SwitchyardRouteFilter::from_config(&config_yaml(endpoint, on_failure)).expect("test filter config is valid")
+    }
+
+    /// Builds a filter with an explicit failure scope.
+    fn make_filter_with_scope(endpoint: &str, on_failure: &str, scope: &str) -> Box<dyn HttpFilter> {
+        SwitchyardRouteFilter::from_config(&config_yaml_with_scope(endpoint, on_failure, scope))
+            .expect("test filter config is valid")
+    }
+
+    /// Builds a filter that only handles normalized streaming requests.
+    fn make_streaming_filter(endpoint: &str, on_failure: &str) -> Box<dyn HttpFilter> {
+        let mut yaml = config_yaml(endpoint, on_failure);
+        yaml["request_scope"] = serde_yaml::Value::String("streaming".to_owned());
+        SwitchyardRouteFilter::from_config(&yaml).expect("test filter config is valid")
     }
 
     /// Builds a filter with an explicit `session_floor` setting.
@@ -1057,6 +1105,19 @@ mod tests {
             filter.selected_clusters(),
             vec!["weak-cluster".to_owned(), "strong-cluster".to_owned()],
             "both tiers must be declared so pipeline validation can see them"
+        );
+    }
+
+    #[test]
+    fn streaming_scope_defers_cluster_binding_to_its_branch() {
+        let filter = make_streaming_filter("http://127.0.0.1:1/v1/chat/completions", "open");
+        assert!(
+            !filter.selects_cluster(),
+            "the scoped instance is bound by its terminal streaming branch"
+        );
+        assert!(
+            filter.selected_clusters().is_empty(),
+            "top-level validation must not expect the branch's load balancer"
         );
     }
 
@@ -1575,6 +1636,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_scope_ignores_non_streaming_requests() {
+        let filter = make_streaming_filter("http://127.0.0.1:1/v1/chat/completions", "closed");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+        let original = chat_body("hello");
+        let mut body = Some(original.clone());
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("an out-of-scope request is not a routing failure");
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(body, Some(original), "an ignored request remains unchanged");
+        assert!(ctx.get_metadata(METADATA_CLUSTER).is_none());
+        assert!(ctx.get_metadata(METADATA_ERROR).is_none());
+    }
+
+    #[tokio::test]
     async fn fails_open_when_routing_fails() {
         // No subrequest client in the context, so the judge can never be called.
         let filter = make_filter("http://127.0.0.1:1/v1/chat/completions", "open");
@@ -1596,6 +1676,39 @@ mod tests {
             Some("subrequest client unavailable"),
             "the failure reason must be recorded for access logs"
         );
+    }
+
+    #[tokio::test]
+    async fn judge_scope_overrides_open_for_judge_failures() {
+        for scope in ["judge", "both"] {
+            let filter = make_filter_with_scope("http://127.0.0.1:1/v1/chat/completions", "open", scope);
+            let request = make_request("/v1/chat/completions");
+            let mut ctx = make_ctx(&request, None);
+            let mut body = Some(chat_body("hello"));
+
+            let action = filter
+                .on_request_body(&mut ctx, &mut body, true)
+                .await
+                .expect("scoped judge failure rejects through FilterAction");
+
+            assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 503));
+        }
+    }
+
+    #[tokio::test]
+    async fn target_scope_preserves_open_for_judge_failures() {
+        let filter = make_filter_with_scope("http://127.0.0.1:1/v1/chat/completions", "open", "target");
+        let request = make_request("/v1/chat/completions");
+        let mut ctx = make_ctx(&request, None);
+        let mut body = Some(chat_body("hello"));
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .expect("target-only scope preserves open judge handling");
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.get_metadata(METADATA_DECISION), Some("default_strong"));
     }
 
     #[tokio::test]
@@ -1681,6 +1794,13 @@ mod tests {
             ctx.cluster_name(),
             Some("strong-cluster"),
             "the body-phase decision must select the cluster"
+        );
+        assert_eq!(
+            ctx.filter_results
+                .get("switchyard_route")
+                .and_then(|results| results.get("status")),
+            Some("selected"),
+            "a terminal streaming branch can consume the selection result"
         );
     }
 
@@ -1855,6 +1975,8 @@ mod tests {
             RouteError::MissingSubrequestClient.may_apply_failure_tier(),
             "no callout client is treated like an unreachable judge"
         );
+        assert!(RouteError::Judge("down".into()).is_judge_failure());
+        assert!(!RouteError::Translation("bad request".into()).is_judge_failure());
     }
 
     #[test]
